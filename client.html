@@ -1,0 +1,169 @@
+<html>
+<body>
+    <video autoplay controls></video>
+    <p>
+        This is a simple video streaming client. Tested in Mozilla Firefox 53.0.2 on linux.
+        To view stream put websocket URL in `hash part` of this page adress.
+        Example: <code>http://gateway.ipfs.io/ipfs/[hash_of_this_page]#ws://localhost:9000</code>
+    </p>
+</body>
+
+<script>
+
+var DEBUG = false;
+
+/* Bufer is a simple wrapper for SourceBuffer. */
+
+var Buffer = function () {
+    this.sourceBuffer = null;
+    this.futureChunks = [];
+    
+};
+
+Buffer.prototype.init = function (mediaSource, mimeCodec) {
+    this.sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
+    this.sourceBuffer.mode = 'sequence';
+
+    // output next chunk when buffer digested provious one
+    var buffer = this;
+    this.sourceBuffer.addEventListener('updateend', function () {
+        buffer.outputReadyChunks();
+    });
+    
+    this.outputReadyChunks();
+};
+
+Buffer.prototype.outputReadyChunks = function () {
+    while (
+        this.sourceBuffer !== null &&
+        !this.sourceBuffer.updating &&
+        this.futureChunks.length > 0 &&
+        this.futureChunks[0].ready
+    ) {
+        var chunk = this.futureChunks.shift();
+        if (chunk.data !== null) {
+            if (DEBUG) console.log(chunk.id, 'chunk pushed to source buffer');
+            this.sourceBuffer.appendBuffer(chunk.data);
+        }
+    }
+};
+
+Buffer.prototype.addFutureChunk = function (chunkId) {
+    var chunk = {
+        ready: false,
+        data: null,
+        id: chunkId,
+    };
+    if (DEBUG) console.log(chunk.id, 'will be future chunk');
+    this.futureChunks.push(chunk);
+    var buffer = this;
+    return function (data) {
+        chunk.ready = true;
+        chunk.data = data;
+        buffer.outputReadyChunks();
+    };
+};
+
+/* Demuxer keeps track of multiple streams. It routes chunks to proper buffers. */
+
+var Demuxer = function (mediaSource, loader) {
+    this.mediaSource = mediaSource;
+    this.loader = loader;
+    this.streams = {};
+};
+
+Demuxer.prototype.pushChunk = function (chunk) {
+    var demuxer = this;
+    var loader = this.loader;
+    loader.getChunkStream(chunk, function (stream) {
+        if (!(stream in demuxer.streams)) {
+            if (DEBUG) console.log(stream, 'new stream');
+            demuxer.streams[stream] = new Buffer();
+            loader.getStreamMimeCodec(stream ,function (mimeCodec) {
+                if (DEBUG) console.log(stream, 'codec', mimeCodec);
+                demuxer.streams[stream].init(demuxer.mediaSource, mimeCodec);
+            });
+            loader.getStreamHeader(stream, demuxer.streams[stream].addFutureChunk(stream + '/header'));
+        }
+        loader.getChunk(chunk, demuxer.streams[stream].addFutureChunk(chunk));
+    });
+};
+
+/* Loader is responsible for delivering data for given objects. This one does AJAX to IPFS gateway. */
+
+var IPFSGatewayLoader = function () {};
+
+IPFSGatewayLoader.prototype.getChunkStream = function (chunk, cb) {
+    return this.getText(chunk + '/stream', cb);
+};
+
+IPFSGatewayLoader.prototype.getStreamMimeCodec = function (stream, cb) {
+    return this.getText(stream + '/mime_codec', cb);
+};
+
+IPFSGatewayLoader.prototype.getStreamHeader = function (stream, cb) {
+    return this.getBlob(stream + '/header', cb);
+};
+
+IPFSGatewayLoader.prototype.getChunk = function (chunk, cb) {
+    return this.getBlob(chunk, cb);
+};
+
+IPFSGatewayLoader.prototype.getText = function (obj, cb) {
+    return this.get(obj, 'text', function (xhr) {
+        cb(xhr.responseText);
+    });
+};
+
+IPFSGatewayLoader.prototype.getBlob = function (obj, cb) {
+    return this.get(obj, 'arraybuffer', function (xhr) {
+        cb(xhr.response);
+    });
+};
+
+IPFSGatewayLoader.prototype.get = function (obj, type, cb) {
+    var xhr = new XMLHttpRequest;
+    xhr.open('get', '/ipfs/' + obj);
+    xhr.responseType = type;
+    xhr.onload = function () {
+        if (xhr.readyState === xhr.DONE) {
+            cb(xhr);
+        }
+    };
+    xhr.send();
+};
+
+var hash = window.location.hash.substring(1);
+if (hash.length > 0) {
+
+    // create mediasource
+    var mediaSource = new MediaSource();
+    mediaSource.addEventListener('sourceopen', function () {
+
+        var demuxer = new Demuxer(mediaSource, new IPFSGatewayLoader());
+        
+        // Read chunks from websocket
+        var ws = new WebSocket(hash);
+        ws.onmessage = function(event) {
+            demuxer.pushChunk(event.data);
+        };
+    });
+
+    // attach mediasource to video tag
+    var video = document.querySelector('video');
+    video.src = URL.createObjectURL(mediaSource);
+
+    // hide help
+    document.querySelector('p').style.display = 'none';
+
+} else {
+    // hide video
+    document.querySelector('video').style.display = 'none';
+}
+
+window.onhashchange = function(){
+    window.location.reload();
+};
+
+</script>
+</html>
